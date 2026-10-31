@@ -250,6 +250,63 @@ pub fn calculate_swim_pose(behavior: Behavior, frame_index: u32) -> SwimPose {
     }
 }
 
+/// The pose at a moment between frames, for scenes that play faster than the loops are
+/// timed: every value eases from one frame's pose to the next, so limbs move smoothly
+/// rather than holding each pose for several frames.
+pub(crate) fn calculate_swim_pose_between(behavior: Behavior, frame_time: f64) -> SwimPose {
+    let whole_frame = frame_time.floor();
+    let share = frame_time - whole_frame;
+    let earlier = calculate_swim_pose(behavior, whole_frame as u32);
+    let later = calculate_swim_pose(behavior, whole_frame as u32 + 1);
+    let mix = |from: f64, to: f64| from + (to - from) * share;
+    let mix_pair = |from: [f64; 2], to: [f64; 2]| [mix(from[0], to[0]), mix(from[1], to[1])];
+    let course = match (earlier.course, later.course) {
+        (
+            Course::Hover {
+                heading_offset_radians: from_heading,
+                drift_pixels: from_drift,
+            },
+            Course::Hover {
+                heading_offset_radians: to_heading,
+                drift_pixels: to_drift,
+            },
+        ) => Course::Hover {
+            heading_offset_radians: mix(from_heading, to_heading),
+            drift_pixels: mix_pair(from_drift, to_drift),
+        },
+        (course, _) => course,
+    };
+    // The wave's phase restarts where the loop does, a whole number of turns earlier.
+    let wave_step =
+        (later.wave_phase_radians - earlier.wave_phase_radians + PI).rem_euclid(TAU) - PI;
+    SwimPose {
+        course,
+        depth: mix(earlier.depth, later.depth),
+        wave_phase_radians: earlier.wave_phase_radians + wave_step * share,
+        wave_strength: mix(earlier.wave_strength, later.wave_strength),
+        tail_lobe_bends_radians: mix_pair(
+            earlier.tail_lobe_bends_radians,
+            later.tail_lobe_bends_radians,
+        ),
+        tail_spread_radians: mix(earlier.tail_spread_radians, later.tail_spread_radians),
+        side_fin_openings_radians: mix_pair(
+            earlier.side_fin_openings_radians,
+            later.side_fin_openings_radians,
+        ),
+        side_fin_bends_radians: mix_pair(
+            earlier.side_fin_bends_radians,
+            later.side_fin_bends_radians,
+        ),
+        pelvic_fin_opening_radians: mix(
+            earlier.pelvic_fin_opening_radians,
+            later.pelvic_fin_opening_radians,
+        ),
+        whisker_sway_radians: mix(earlier.whisker_sway_radians, later.whisker_sway_radians),
+        feeding_phase: earlier.feeding_phase,
+        mouth_opening: mix(earlier.mouth_opening, later.mouth_opening),
+    }
+}
+
 /// What a behavior decides for one frame; the tail, fin trail, pelvic fins, and
 /// whiskers follow from it the same way for every behavior.
 struct Drive {

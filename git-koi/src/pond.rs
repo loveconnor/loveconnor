@@ -16,11 +16,13 @@ use crate::behavior::{Behavior, select_behavior};
 use crate::coat::KoiBody;
 use crate::history::{AccountSnapshot, summarize_contributions};
 use crate::koi::{KoiDevelopment, KoiDevelopmentError, RecentStreak, derive_koi_development};
-use crate::motion::{Course, calculate_swim_pose};
+use crate::motion::{Course, calculate_swim_pose, calculate_swim_pose_between};
 use crate::render::{
     FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, calculate_koi_body_length, render_placed_koi,
 };
-use crate::school::{FryPlace, KoiMotion, PelletLife, School, SchoolSetup, simulate_school};
+use crate::school::{
+    FryPlace, KoiMotion, PelletLife, School, SchoolSetup, resample_school, simulate_school,
+};
 
 /// Width of the native scene; exports scale it up exactly.
 pub const POND_WIDTH_PIXELS: u32 = 520;
@@ -29,11 +31,11 @@ pub const POND_HEIGHT_PIXELS: u32 = 208;
 
 const WIDTH: i32 = POND_WIDTH_PIXELS as i32;
 const HEIGHT: i32 = POND_HEIGHT_PIXELS as i32;
-/// Whole numbers of cruise, dart, and deep rest pose loops, long enough that the koi
-/// can get well away from where it starts and come back.
-const SWIM_LOOP_FRAMES: usize = 480;
-/// A whole number of rest pose loops.
-const REST_LOOP_FRAMES: usize = 360;
+/// The fish are simulated at the frame rate their poses are timed for: 24 seconds, a whole
+/// number of every behavior's pose loop.
+const SIMULATED_FRAMES: usize = 360;
+/// The same 24 seconds as shown, at 25 frames per second.
+const SHOWN_FRAMES: usize = 600;
 /// Points kept of the koi's trail per frame, one pixel apart; the longest koi fits.
 const KOI_TRAIL_POINTS: usize = 280;
 const HOVER_HEAD: [i32; 2] = [320, 104];
@@ -62,8 +64,8 @@ const SHADOW_STRENGTH: f64 = 0.68;
 const MAX_FRY: usize = 12;
 const MAX_PELLETS: u64 = 24;
 /// How long a pellet's ripples last.
-const RIPPLE_FRAMES: u32 = 16;
-const MOUTH_OPEN_FRAMES: u32 = 10;
+const RIPPLE_FRAMES: u32 = 26;
+const MOUTH_OPEN_FRAMES: u32 = 17;
 const SPARKLE_COUNT: u32 = 26;
 const MAX_LILY_PADS: usize = 10;
 /// Pads sit in the corners and along the edges, where the koi's track leaves water.
@@ -189,18 +191,20 @@ impl Pond {
             })
             .collect();
 
-        let frame_count = calculate_frame_count(behavior) as u32;
-        let school = simulate_school(&SchoolSetup {
-            seed,
-            frame_count: frame_count as usize,
-            fry_lengths: fry_looks.iter().map(|look| look.length_pixels).collect(),
-            pellet_count: koi_development
-                .recent_activity
-                .recent_contributions
-                .min(MAX_PELLETS) as u32,
-            koi_body_length: calculate_koi_body_length(koi_development.total_contributions),
-            koi_motion: calculate_koi_motion(behavior, frame_count),
-        });
+        let school = resample_school(
+            simulate_school(&SchoolSetup {
+                seed,
+                frame_count: SIMULATED_FRAMES,
+                fry_lengths: fry_looks.iter().map(|look| look.length_pixels).collect(),
+                pellet_count: koi_development
+                    .recent_activity
+                    .recent_contributions
+                    .min(MAX_PELLETS) as u32,
+                koi_body_length: calculate_koi_body_length(koi_development.total_contributions),
+                koi_motion: calculate_koi_motion(behavior, SIMULATED_FRAMES as u32),
+            }),
+            SHOWN_FRAMES,
+        );
 
         let sparkles = (0..SPARKLE_COUNT)
             .map(|sparkle_index| {
@@ -210,7 +214,7 @@ impl Pond {
                         12 + (mixed % (WIDTH as u64 - 24)) as i32,
                         12 + ((mixed >> 20) % (HEIGHT as u64 - 24)) as i32,
                     ],
-                    phase_frames: (mixed >> 40) as u32 % frame_count,
+                    phase_frames: (mixed >> 40) as u32 % SHOWN_FRAMES as u32,
                 }
             })
             .collect();
@@ -229,7 +233,7 @@ impl Pond {
 
     /// Frames in the pond's loop.
     pub fn frame_count(&self) -> u32 {
-        calculate_frame_count(self.behavior) as u32
+        SHOWN_FRAMES as u32
     }
 
     /// The fry swimming today, one per language up to the limit.
@@ -383,8 +387,9 @@ impl Pond {
 
     fn draw_koi(&self, pixels: &mut [[u8; 4]], swim_mask: &mut [bool], frame: u32) {
         let resting = is_resting(self.behavior);
+        let pose_time = f64::from(frame) * SIMULATED_FRAMES as f64 / SHOWN_FRAMES as f64;
         let mut swim_pose = if resting {
-            calculate_swim_pose(self.behavior, frame)
+            calculate_swim_pose_between(self.behavior, pose_time)
         } else {
             let lap_behavior = if self.behavior == Behavior::Dart {
                 Behavior::Dart
@@ -393,7 +398,7 @@ impl Pond {
             };
             crate::motion::SwimPose {
                 course: Course::Trail,
-                ..calculate_swim_pose(lap_behavior, frame)
+                ..calculate_swim_pose_between(lap_behavior, pose_time)
             }
         };
         if let Some(gap) = self
@@ -442,14 +447,6 @@ impl Pond {
             )
         });
         visit(&mut |x, y, color| put(pixels, x, y, color));
-    }
-}
-
-fn calculate_frame_count(behavior: Behavior) -> usize {
-    if behavior == Behavior::Rest {
-        REST_LOOP_FRAMES
-    } else {
-        SWIM_LOOP_FRAMES
     }
 }
 
@@ -688,6 +685,9 @@ fn shade_fry(color: [u8; 3]) -> [[u8; 4]; 3] {
 
 fn draw_fry(pixels: &mut [[u8; 4]], swim_mask: &mut [bool], fry: &FryLook, place: FryPlace) {
     let (center, forward) = (place.head, place.forward);
+    // Sample at the fish's exact position, so it glides between pixels instead of holding
+    // still and then snapping to the next one.
+    let fraction = [center[0] - center[0].floor(), center[1] - center[1].floor()];
     let wag = place.wag;
     let length = fry.length_pixels;
     let half_width = (length * 0.24).max(3.0);
@@ -696,7 +696,10 @@ fn draw_fry(pixels: &mut [[u8; 4]], swim_mask: &mut [bool], fry: &FryLook, place
     let mut shape = Vec::new();
     for dy in -reach..=reach {
         for dx in -reach..=reach {
-            let offset = [f64::from(dx) + 0.5, f64::from(dy) + 0.5];
+            let offset = [
+                f64::from(dx) + 0.5 - fraction[0],
+                f64::from(dy) + 0.5 - fraction[1],
+            ];
             // Along runs back from the snout; across runs to the fish's right.
             let along = -(offset[0] * forward[0] + offset[1] * forward[1]);
             let across = -offset[0] * forward[1] + offset[1] * forward[0];
@@ -792,7 +795,7 @@ fn draw_pellet(pixels: &mut [[u8; 4]], pellet: &PelletLife, frame: u32) {
 fn draw_sparkle(pixels: &mut [[u8; 4]], sparkle: &Sparkle, frame: u32, frame_count: u32) {
     const GLINT: [u8; 4] = [150, 214, 220, 255];
     const SOFT_GLINT: [u8; 4] = [62, 132, 146, 255];
-    const SPARKLE_FRAMES: u32 = 24;
+    const SPARKLE_FRAMES: u32 = 40;
     let age = (frame + frame_count - sparkle.phase_frames) % frame_count;
     let [x, y] = sparkle.position;
     if age < SPARKLE_FRAMES {

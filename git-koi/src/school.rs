@@ -286,6 +286,74 @@ fn count_frames_out_of_water(setup: &SchoolSetup, school: &School) -> usize {
         .count()
 }
 
+/// Play a school at a higher frame rate: positions follow a smooth curve through the
+/// simulated frames, so nothing moves in straight segments between them.
+pub(crate) fn resample_school(school: School, shown_frames: usize) -> School {
+    let simulated_frames = school.koi_heads.len();
+    let time_of = |shown: usize| shown as f64 * simulated_frames as f64 / shown_frames as f64;
+    let koi_heads = (0..shown_frames)
+        .map(|shown| sample_curve(&school.koi_heads, time_of(shown)))
+        .collect();
+    let fry = school
+        .fry
+        .iter()
+        .map(|track| {
+            let heads: Vec<[f64; 2]> = track.iter().map(|place| place.head).collect();
+            (0..shown_frames)
+                .map(|shown| {
+                    let time = time_of(shown);
+                    let earlier = track[time.floor() as usize % simulated_frames];
+                    let later = track[(time.floor() as usize + 1) % simulated_frames];
+                    let share = time - time.floor();
+                    let mix = |from: f64, to: f64| from + (to - from) * share;
+                    FryPlace {
+                        head: sample_curve(&heads, time),
+                        forward: normalize([
+                            mix(earlier.forward[0], later.forward[0]),
+                            mix(earlier.forward[1], later.forward[1]),
+                        ]),
+                        turn_radians: mix(earlier.turn_radians, later.turn_radians),
+                        wag: mix(earlier.wag, later.wag),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let scale_frame = |frame: u32| {
+        (f64::from(frame) * shown_frames as f64 / simulated_frames as f64).round() as u32
+    };
+    let pellets = school
+        .pellets
+        .iter()
+        .map(|pellet| PelletLife {
+            landed_at: scale_frame(pellet.landed_at),
+            gone_at: scale_frame(pellet.gone_at),
+            ..*pellet
+        })
+        .collect();
+    School {
+        koi_heads,
+        fry,
+        pellets,
+    }
+}
+
+/// A Catmull-Rom curve through a looping track, at a moment between its frames.
+fn sample_curve(points: &[[f64; 2]], time: f64) -> [f64; 2] {
+    let total = points.len();
+    let whole = time.floor() as usize;
+    let share = time - time.floor();
+    let at = |offset: usize| points[(whole + total + offset - 1) % total];
+    let (before, here, next, after) = (at(0), at(1), at(2), at(3));
+    [0, 1].map(|axis| {
+        let (p0, p1, p2, p3) = (before[axis], here[axis], next[axis], after[axis]);
+        0.5 * (2.0 * p1
+            + (p2 - p0) * share
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * share * share
+            + (3.0 * p1 - p0 - 3.0 * p2 + p3) * share * share * share)
+    })
+}
+
 /// Simulate one whole loop and close it.
 fn swim_once(setup: &SchoolSetup, seed: u64) -> School {
     let frame_count = setup.frame_count;
@@ -846,6 +914,23 @@ fn closing_correction(
     corrections
 }
 
+/// Soften a looping track, so a nudge from a neighbor reads as a fish easing aside and
+/// not as a twitch.
+fn smooth_track(points: &mut Vec<[f64; 2]>) {
+    const PASSES: usize = 4;
+    let total = points.len();
+    for _ in 0..PASSES {
+        *points = (0..total)
+            .map(|frame| {
+                let before = points[(frame + total - 1) % total];
+                let here = points[frame];
+                let after = points[(frame + 1) % total];
+                [0, 1].map(|axis| (before[axis] + 2.0 * here[axis] + after[axis]) / 4.0)
+            })
+            .collect();
+    }
+}
+
 /// Close a list of positions recorded for frames zero through the loop's length, then
 /// drop the repeated last frame.
 fn close_loop_points(points: &mut Vec<[f64; 2]>) {
@@ -884,6 +969,7 @@ fn close_fry(record: &mut Vec<FryPlace>) {
         head[1] += correction[1];
     }
     heads.pop();
+    smooth_track(&mut heads);
     let frame_total = heads.len();
     let total_tail_phase = record[frame_total].wag;
     let whole_beats = (total_tail_phase / TAU).round().max(1.0);

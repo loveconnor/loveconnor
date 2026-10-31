@@ -228,6 +228,10 @@ fn find_drawn_box(native_pixels: &[[u8; 4]]) -> [u32; 4] {
     })
 }
 
+/// Hundredths of a second per scene frame: an even 25 frames per second, a rate GIF timing
+/// can hold exactly, where 15 per second has to alternate uneven delays.
+pub const SCENE_FRAME_HUNDREDTHS: u16 = 4;
+
 /// Encode a still of any size at [`STATIC_EXPORT_SCALE`], keeping color and alpha.
 pub fn encode_scene_png(
     rgba_pixels: &[[u8; 4]],
@@ -341,8 +345,7 @@ pub fn encode_scene_gif(
             }
         }
         gif_encoder.write_frame(&gif::Frame {
-            delay: calculate_elapsed_hundredths(frame_index + 1)
-                - calculate_elapsed_hundredths(frame_index),
+            delay: SCENE_FRAME_HUNDREDTHS,
             dispose: gif::DisposalMethod::Keep,
             transparent: Some(GIF_TRANSPARENT_INDEX),
             left: (box_left * scale) as u16,
