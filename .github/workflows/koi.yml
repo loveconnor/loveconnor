@@ -1,14 +1,12 @@
-# Copy into your profile repository as .github/workflows/koi.yml, then embed
-# <img src="koi/koi.gif" width="256" alt="My koi"> in its README.md.
 name: Koi
 
 on:
   schedule:
-    # Just after midnight UTC, so the koi shows the day that just ended.
+    # Just after midnight UTC, so the pond shows the day that just ended.
     - cron: "20 0 * * *"
   workflow_dispatch:
   push:
-    paths: [.github/workflows/koi.yml]
+    paths: [.github/workflows/koi.yml, git-koi/**]
 
 permissions:
   contents: write
@@ -20,19 +18,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: yalongwastaken/git-koi@v1
-        with:
-          body: asagi
-          output-dir: koi
-      - name: Commit the koi if it changed
-        shell: bash
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Draw the pond
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git add koi/koi.gif
+          cd git-koi
+          cargo +stable build --release --locked
+          ./target/release/git-koi collect "$GITHUB_REPOSITORY_OWNER" --output "$RUNNER_TEMP/snapshot.json"
+          ./target/release/git-koi pond "$RUNNER_TEMP/snapshot.json" --output-dir ../koi --body asagi
+      - name: Commit the pond if it changed
+        run: |
+          git add koi/pond.gif
           if git diff --cached --quiet; then
-            echo "The koi is unchanged; nothing to commit."
+            echo "The pond is unchanged; nothing to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit --quiet --message "koi: draw the day's koi"
+          git commit --quiet --message "koi: draw the day's pond"
           git push --quiet
