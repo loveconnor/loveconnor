@@ -21,7 +21,7 @@ const KOI_CRUISE_SPEED: f64 = 2.1;
 const KOI_DART_SPEED: f64 = 3.4;
 const KOI_SIGHT_PIXELS: f64 = 260.0;
 const KOI_BITE_PIXELS: f64 = 13.0;
-const FRY_SIGHT_PIXELS: f64 = 70.0;
+const FRY_SIGHT_PIXELS: f64 = 170.0;
 const FRY_BITE_PIXELS: f64 = 4.5;
 const FRY_MAX_SPEED: f64 = 3.4;
 /// However hemmed in a fry is, it can only move this far in a frame: it swims out of the
@@ -165,7 +165,7 @@ fn wall_push(point: [f64; 2], [left, top, right, bottom]: [f64; 4], margin: f64)
 /// and it gets a fair share of the food. The choice is as repeatable as each swim.
 pub(crate) fn simulate_school(setup: &SchoolSetup) -> School {
     const ATTEMPTS: u64 = 60;
-    let wanted_bites = setup.pellet_count as usize / 3;
+    let wanted_bites = setup.pellet_count as usize / 4;
     let mut best: Option<((usize, usize), School)> = None;
     for attempt in 0..ATTEMPTS {
         let school = swim_once(
@@ -177,18 +177,17 @@ pub(crate) fn simulate_school(setup: &SchoolSetup) -> School {
             .iter()
             .filter(|pellet| pellet.eaten_by_koi)
             .count();
+        let sunk = school.pellets.iter().filter(|pellet| pellet.sank).count();
+        let fry_bites = school.pellets.len() - koi_bites - sunk;
         let score = (
             count_frames_out_of_water(setup, &school) + count_frames_touching(setup, &school),
-            wanted_bites.saturating_sub(koi_bites),
+            wanted_bites.saturating_sub(koi_bites) + wanted_bites.saturating_sub(fry_bites) + sunk,
         );
         if best
             .as_ref()
             .is_none_or(|(best_score, _)| score < *best_score)
         {
             best = Some((score, school));
-        }
-        if score == (0, 0) {
-            break;
         }
     }
     best.expect("at least one attempt ran").1
@@ -389,7 +388,7 @@ fn swim_once(setup: &SchoolSetup, seed: u64) -> School {
                 start_head: head,
                 start_heading: heading,
                 is_going_home: false,
-                full_frames: dice.between(0.0, 240.0) as u32,
+                full_frames: dice.between(0.0, 60.0) as u32,
             }
         })
         .collect();
@@ -556,7 +555,7 @@ fn swim_once(setup: &SchoolSetup, seed: u64) -> School {
             }) {
                 pellet.gone_at = frame_number + 1;
                 pellet.sank = false;
-                eater.full_frames = dice.between(120.0, 300.0) as u32;
+                eater.full_frames = dice.between(50.0, 120.0) as u32;
             }
         }
     }
@@ -765,9 +764,9 @@ fn step_fry(
         .filter(|(reach_to, _)| *reach_to < FRY_SIGHT_PIXELS)
         // A fry leaves food alone when the koi is nearer to it: it is not worth the risk.
         .filter(|(reach_to, position)| {
-            koi_circles
-                .first()
-                .is_none_or(|(koi_front, _)| distance(*koi_front, *position) > reach_to + 45.0)
+            koi_circles.first().is_none_or(|(koi_front, _)| {
+                distance(*koi_front, *position) > reach_to * 0.6 + 20.0
+            })
         })
         .min_by(|left, right| left.0.total_cmp(&right.0));
     fish.full_frames = fish.full_frames.saturating_sub(1);

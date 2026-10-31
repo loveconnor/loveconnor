@@ -63,7 +63,7 @@ const SHADOW_STRENGTH: f64 = 0.68;
 
 /// Only the most-used languages get a fry, so the pond never feels crowded.
 const MAX_FRY: usize = 5;
-const MAX_PELLETS: u64 = 24;
+const MAX_PELLETS: u64 = 14;
 /// How long a pellet's ripples last.
 const RIPPLE_FRAMES: u32 = 26;
 const MOUTH_OPEN_FRAMES: u32 = 17;
