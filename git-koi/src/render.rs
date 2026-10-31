@@ -141,6 +141,18 @@ pub(crate) fn render_placed_koi(
     )
 }
 
+/// The way the tail points in a trail pose, in radians.
+pub(crate) fn calculate_tail_angle(
+    koi_development: &KoiDevelopment,
+    swim_pose: &SwimPose,
+    body_trail: &[[f64; 2]],
+) -> f64 {
+    let koi_anatomy = calculate_anatomy(koi_development.total_contributions);
+    let body_spine = build_spine(&koi_anatomy, swim_pose, Some(body_trail));
+    let [forward_x, forward_y] = calculate_tail_stalk_direction(&body_spine, body_spine.len() - 1);
+    forward_y.atan2(forward_x)
+}
+
 /// The koi's body length at a total, which the pond's fish keep clear of.
 pub(crate) fn calculate_koi_body_length(total_contributions: u64) -> f64 {
     calculate_anatomy(total_contributions).body_length_pixels

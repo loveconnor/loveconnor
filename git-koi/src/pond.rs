@@ -18,7 +18,8 @@ use crate::history::{AccountSnapshot, summarize_contributions};
 use crate::koi::{KoiDevelopment, KoiDevelopmentError, RecentStreak, derive_koi_development};
 use crate::motion::{Course, calculate_swim_pose, calculate_swim_pose_between};
 use crate::render::{
-    FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, calculate_koi_body_length, render_placed_koi,
+    FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, calculate_koi_body_length, calculate_tail_angle,
+    render_placed_koi,
 };
 use crate::school::{
     FryPlace, KoiMotion, PelletLife, School, SchoolSetup, resample_school, simulate_school,
@@ -304,6 +305,41 @@ impl Pond {
         closest
     }
 
+    /// The most the koi's tail turns over any 0.4 seconds, in radians. A calm fish's tail
+    /// sways; much more than this and it reads as thrashing. Zero for a resting koi.
+    pub fn sharpest_tail_swing(&self) -> f64 {
+        const WINDOW_FRAMES: usize = 10;
+        if is_resting(self.behavior) {
+            return 0.0;
+        }
+        let lap_behavior = if self.behavior == Behavior::Dart {
+            Behavior::Dart
+        } else {
+            Behavior::Cruise
+        };
+        let frame_total = self.frame_count() as usize;
+        let angles: Vec<f64> = (0..frame_total)
+            .map(|frame| {
+                let pose_time = frame as f64 * SIMULATED_FRAMES as f64 / SHOWN_FRAMES as f64;
+                let swim_pose = calm_swimming_wave(crate::motion::SwimPose {
+                    course: Course::Trail,
+                    ..calculate_swim_pose_between(lap_behavior, pose_time)
+                });
+                calculate_tail_angle(
+                    &self.koi_development,
+                    &swim_pose,
+                    &self.calculate_koi_trail(frame),
+                )
+            })
+            .collect();
+        (0..frame_total)
+            .map(|frame| {
+                let later = angles[(frame + WINDOW_FRAMES) % frame_total];
+                ((later - angles[frame] + PI).rem_euclid(TAU) - PI).abs()
+            })
+            .fold(0.0, f64::max)
+    }
+
     /// The farthest any fry moves in one frame, in native pixels.
     pub fn fastest_fry_step(&self) -> f64 {
         self.school
@@ -402,6 +438,9 @@ impl Pond {
                 ..calculate_swim_pose_between(lap_behavior, pose_time)
             }
         };
+        if !resting {
+            swim_pose = calm_swimming_wave(swim_pose);
+        }
         if let Some(gap) = self
             .school
             .pellets
@@ -453,6 +492,19 @@ impl Pond {
 
 fn is_resting(behavior: Behavior) -> bool {
     matches!(behavior, Behavior::Rest | Behavior::DeepRest)
+}
+
+/// A koi in the pond swims calmly: the standalone loop's wave is exaggerated so it reads
+/// at a small size, and here that makes the tail thrash.
+fn calm_swimming_wave(swim_pose: crate::motion::SwimPose) -> crate::motion::SwimPose {
+    const CALM_SHARE: f64 = 0.45;
+    crate::motion::SwimPose {
+        wave_strength: swim_pose.wave_strength * CALM_SHARE,
+        tail_lobe_bends_radians: swim_pose
+            .tail_lobe_bends_radians
+            .map(|bend| bend * CALM_SHARE),
+        ..swim_pose
+    }
 }
 
 /// What the simulation should do with the koi. A swimming koi's speed follows its

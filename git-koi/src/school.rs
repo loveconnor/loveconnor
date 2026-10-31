@@ -15,8 +15,13 @@ const WATER_BOUNDS: [f64; 4] = [9.0, 9.0, 511.0, 199.0];
 /// nothing has to be pulled into place afterward.
 const ARRIVAL_FRAMES: f64 = 80.0;
 /// The koi turns back before its long body could reach the shore.
-const KOI_BOUNDS: [f64; 4] = [84.0, 62.0, 436.0, 146.0];
-const KOI_TURN_RADIUS_PIXELS: f64 = 34.0;
+const KOI_BOUNDS: [f64; 4] = [92.0, 56.0, 428.0, 152.0];
+/// Wide enough that the long body sweeps around a turn instead of curling up, which would
+/// whip the tail around the bend.
+const KOI_TURN_RADIUS_PIXELS: f64 = 56.0;
+/// How quickly the koi can change how hard it is turning, in radians per frame per frame.
+/// A heavy fish leans into a turn and out of it, and cannot flip from left to right at once.
+const KOI_TURN_EASE: f64 = 0.0035;
 const KOI_CRUISE_SPEED: f64 = 2.1;
 const KOI_DART_SPEED: f64 = 3.4;
 const KOI_SIGHT_PIXELS: f64 = 260.0;
@@ -180,7 +185,13 @@ pub(crate) fn simulate_school(setup: &SchoolSetup) -> School {
         let sunk = school.pellets.iter().filter(|pellet| pellet.sank).count();
         let fry_bites = school.pellets.len() - koi_bites - sunk;
         let score = (
-            count_frames_out_of_water(setup, &school) + count_frames_touching(setup, &school),
+            count_frames_out_of_water(setup, &school)
+                + count_frames_touching(setup, &school)
+                + if matches!(setup.koi_motion, KoiMotion::Swimming { .. }) {
+                    count_frames_turning_too_tight(&school)
+                } else {
+                    0
+                },
             wanted_bites.saturating_sub(koi_bites) + wanted_bites.saturating_sub(fry_bites) + sunk,
         );
         if best
@@ -368,6 +379,9 @@ fn swim_once(setup: &SchoolSetup, seed: u64) -> School {
     let mut koi_goal = dice.point_within(KOI_BOUNDS);
     let mut koi_heads: Vec<[f64; 2]> = Vec::with_capacity(frame_count + 1);
     let mut koi_going_home = false;
+    let mut koi_turn_rate = 0.0_f64;
+    // The pellet it has decided on: it finishes one errand before starting another.
+    let mut koi_target: Option<usize> = None;
 
     let mut fish: Vec<Fish> = setup
         .fry_lengths
@@ -443,17 +457,25 @@ fn swim_once(setup: &SchoolSetup, seed: u64) -> School {
                     * (surges[frame % surges.len()] * 0.5 + 0.5);
                 lead
             } else {
+                let still_wanted = koi_target
+                    .filter(|index| is_afloat(&pellets[*index]))
+                    .filter(|index| {
+                        distance(koi_head, pellets[*index].position)
+                            > 2.0 * KOI_TURN_RADIUS_PIXELS / 3.0
+                    });
                 let reachable_food = pellets
                     .iter()
-                    .filter(|pellet| is_afloat(pellet))
+                    .enumerate()
+                    .map(|(index, pellet)| (index, pellet))
+                    .filter(|(_, pellet)| is_afloat(pellet))
                     // Food by the shore is for the fry; the koi cannot turn there.
-                    .filter(|pellet| {
+                    .filter(|(_, pellet)| {
                         pellet.position[0] > KOI_BOUNDS[0]
                             && pellet.position[0] < KOI_BOUNDS[2]
                             && pellet.position[1] > KOI_BOUNDS[1]
                             && pellet.position[1] < KOI_BOUNDS[3]
                     })
-                    .filter(|pellet| {
+                    .filter(|(_, pellet)| {
                         let offset = distance(koi_head, pellet.position);
                         let bearing = (pellet.position[1] - koi_head[1])
                             .atan2(pellet.position[0] - koi_head[0]);
@@ -463,13 +485,15 @@ fn swim_once(setup: &SchoolSetup, seed: u64) -> School {
                             && offset > 2.0 * KOI_TURN_RADIUS_PIXELS * off_nose.sin().abs()
                             && off_nose < 2.2
                     })
-                    .min_by(|left, right| {
+                    .min_by(|(_, left), (_, right)| {
                         distance(koi_head, left.position)
                             .total_cmp(&distance(koi_head, right.position))
                     });
-                if let Some(pellet) = reachable_food {
+                let chosen = still_wanted.or(reachable_food.map(|(index, _)| index));
+                koi_target = chosen;
+                if let Some(index) = chosen {
                     speed *= 1.3;
-                    pellet.position
+                    pellets[index].position
                 } else {
                     if distance(koi_head, koi_goal) < 45.0 {
                         // Somewhere it isn't: fish do not dither over a few body lengths.
@@ -491,8 +515,12 @@ fn swim_once(setup: &SchoolSetup, seed: u64) -> School {
             let toward = normalize([steer_to[0] - koi_head[0], steer_to[1] - koi_head[1]]);
             let desired = [toward[0] + push[0] * 4.0, toward[1] + push[1] * 4.0];
             let turn_limit = speed / KOI_TURN_RADIUS_PIXELS;
-            koi_heading += angle_between(koi_heading, desired[1].atan2(desired[0]))
+            let wanted_turn = (angle_between(koi_heading, desired[1].atan2(desired[0])) * 0.08)
                 .clamp(-turn_limit, turn_limit);
+            koi_turn_rate += (wanted_turn - koi_turn_rate).clamp(-KOI_TURN_EASE, KOI_TURN_EASE);
+            // Slowing down must not tighten a turn already under way.
+            koi_turn_rate = koi_turn_rate.clamp(-turn_limit, turn_limit);
+            koi_heading += koi_turn_rate;
             koi_head[0] += koi_heading.cos() * speed;
             koi_head[1] += koi_heading.sin() * speed;
         }
@@ -563,7 +591,7 @@ fn swim_once(setup: &SchoolSetup, seed: u64) -> School {
         pellet.gone_at = pellet.gone_at.min(sink_frame);
     }
 
-    close_loop_points(&mut koi_heads);
+    close_koi_trail(&mut koi_heads);
     let fry = fry_records
         .into_iter()
         .map(|mut record| {
@@ -930,24 +958,44 @@ fn smooth_track(points: &mut Vec<[f64; 2]>) {
     }
 }
 
-/// Close a list of positions recorded for frames zero through the loop's length, then
-/// drop the repeated last frame.
-fn close_loop_points(points: &mut Vec<[f64; 2]>) {
+/// Close the koi's trail over a long stretch of the loop and round off what remains, since
+/// any corner left in it travels down the body and whips the tail as it arrives.
+fn close_koi_trail(points: &mut Vec<[f64; 2]>) {
+    const KOI_CLOSING_FRAMES: usize = 200;
+    const KOI_SMOOTHING_ROUNDS: usize = 12;
     let frames_total = points.len() - 1;
     let end_gap = [0, 1].map(|axis| points[0][axis] - points[frames_total][axis]);
-    let velocity_gap = [0, 1].map(|axis| {
-        (points[1][axis] - points[0][axis])
-            - (points[frames_total][axis] - points[frames_total - 1][axis])
-    });
-    for (point, correction) in
-        points
-            .iter_mut()
-            .zip(closing_correction(frames_total, end_gap, velocity_gap))
-    {
-        point[0] += correction[0];
-        point[1] += correction[1];
+    let window = KOI_CLOSING_FRAMES.min(frames_total - 1);
+    for frame in frames_total - window..=frames_total {
+        let share = (frame + window - frames_total) as f64 / window as f64;
+        let blend = share * share * (3.0 - 2.0 * share);
+        for axis in 0..2 {
+            points[frame][axis] += end_gap[axis] * blend;
+        }
     }
     points.pop();
+    for _ in 0..KOI_SMOOTHING_ROUNDS {
+        smooth_track(points);
+    }
+}
+
+/// Frames in which the koi's trail bends tighter than its body can follow.
+fn count_frames_turning_too_tight(school: &School) -> usize {
+    const TIGHTEST_RADIUS_PIXELS: f64 = 36.0;
+    const SPAN_FRAMES: usize = 6;
+    let heads = &school.koi_heads;
+    let total = heads.len();
+    (0..total)
+        .filter(|frame| {
+            let before = heads[(frame + total - SPAN_FRAMES) % total];
+            let here = heads[*frame];
+            let after = heads[(frame + SPAN_FRAMES) % total];
+            let in_angle = (here[1] - before[1]).atan2(here[0] - before[0]);
+            let out_angle = (after[1] - here[1]).atan2(after[0] - here[0]);
+            let arc = distance(before, here) + distance(here, after);
+            angle_between(in_angle, out_angle).abs() * TIGHTEST_RADIUS_PIXELS > arc
+        })
+        .count()
 }
 
 /// Close a fry's track, then work out how it faces and how its tail swings from where
