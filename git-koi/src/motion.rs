@@ -258,6 +258,9 @@ pub(crate) fn calculate_swim_pose_between(behavior: Behavior, frame_time: f64) -
     let share = frame_time - whole_frame;
     let earlier = calculate_swim_pose(behavior, whole_frame as u32);
     let later = calculate_swim_pose(behavior, whole_frame as u32 + 1);
+    // The fan opens with a sharp corner in its timing, so it is softened over its neighbors.
+    let before = calculate_swim_pose(behavior, whole_frame as u32 + frame_count(behavior) - 1);
+    let after = calculate_swim_pose(behavior, whole_frame as u32 + 2);
     let mix = |from: f64, to: f64| from + (to - from) * share;
     let mix_pair = |from: [f64; 2], to: [f64; 2]| [mix(from[0], to[0]), mix(from[1], to[1])];
     let course = match (earlier.course, later.course) {
@@ -279,16 +282,24 @@ pub(crate) fn calculate_swim_pose_between(behavior: Behavior, frame_time: f64) -
     // The wave's phase restarts where the loop does, a whole number of turns earlier.
     let wave_step =
         (later.wave_phase_radians - earlier.wave_phase_radians + PI).rem_euclid(TAU) - PI;
+    let wave_phase_radians = earlier.wave_phase_radians + wave_step * share;
+    let wave_strength = mix(earlier.wave_strength, later.wave_strength);
+    // Work the swinging parts out from the phase itself, not from neighboring frames: a
+    // straight line between samples of a fast swing would look faceted.
+    let tail_bend = TAIL_BEND_PER_WAVE_STRENGTH
+        * wave_strength
+        * (wave_phase_radians - TAIL_BEND_LAG_RADIANS).sin();
+    let tail_split = TAIL_SPLIT_RADIANS * (wave_phase_radians - TAIL_SPLIT_LAG_RADIANS).sin();
     SwimPose {
         course,
         depth: mix(earlier.depth, later.depth),
-        wave_phase_radians: earlier.wave_phase_radians + wave_step * share,
-        wave_strength: mix(earlier.wave_strength, later.wave_strength),
-        tail_lobe_bends_radians: mix_pair(
-            earlier.tail_lobe_bends_radians,
-            later.tail_lobe_bends_radians,
-        ),
-        tail_spread_radians: mix(earlier.tail_spread_radians, later.tail_spread_radians),
+        wave_phase_radians,
+        wave_strength,
+        tail_lobe_bends_radians: [tail_bend - tail_split, tail_bend + tail_split],
+        tail_spread_radians: (mix(before.tail_spread_radians, earlier.tail_spread_radians)
+            + 2.0 * mix(earlier.tail_spread_radians, later.tail_spread_radians)
+            + mix(later.tail_spread_radians, after.tail_spread_radians))
+            / 4.0,
         side_fin_openings_radians: mix_pair(
             earlier.side_fin_openings_radians,
             later.side_fin_openings_radians,
@@ -301,7 +312,8 @@ pub(crate) fn calculate_swim_pose_between(behavior: Behavior, frame_time: f64) -
             earlier.pelvic_fin_opening_radians,
             later.pelvic_fin_opening_radians,
         ),
-        whisker_sway_radians: mix(earlier.whisker_sway_radians, later.whisker_sway_radians),
+        whisker_sway_radians: WHISKER_SWAY_RADIANS
+            * (wave_phase_radians - WHISKER_SWAY_LAG_RADIANS).sin(),
         feeding_phase: earlier.feeding_phase,
         mouth_opening: mix(earlier.mouth_opening, later.mouth_opening),
     }

@@ -814,9 +814,29 @@ fn build_spine(
         }
         Course::Trail => {
             let trail = body_trail.expect("a trail pose is rendered with its trail");
-            (0..point_count)
-                .map(|point_index| CurvePoint {
-                    position: trail[point_index.min(trail.len() - 1)],
+            // The trail is a chain of short straight steps. Round off its corners so the
+            // body bends in one curve, or each corner passing along it nudges the tail.
+            const SMOOTHING_PASSES: usize = 10;
+            let mut positions: Vec<[f64; 2]> = (0..point_count)
+                .map(|point_index| trail[point_index.min(trail.len() - 1)])
+                .collect();
+            for _ in 0..SMOOTHING_PASSES {
+                let previous = positions.clone();
+                for point_index in 1..point_count - 1 {
+                    for axis_index in 0..2 {
+                        positions[point_index][axis_index] = (previous[point_index - 1]
+                            [axis_index]
+                            + 2.0 * previous[point_index][axis_index]
+                            + previous[point_index + 1][axis_index])
+                            / 4.0;
+                    }
+                }
+            }
+            positions
+                .into_iter()
+                .enumerate()
+                .map(|(point_index, position)| CurvePoint {
+                    position,
                     half_width_pixels: calculate_point_half_width(point_index),
                 })
                 .collect()
@@ -873,7 +893,12 @@ fn build_fins(
         let root_index =
             (fin_pair.root_along_fraction * (body_spine.len() - 1) as f64).round() as usize;
         let root_point = body_spine[root_index];
-        let forward_direction = calculate_forward_direction(body_spine, root_index);
+        let forward_direction = match (fin_pair.fin_kind, swim_pose.course) {
+            (FinKind::Tail, Course::Trail) => {
+                calculate_tail_stalk_direction(body_spine, root_index)
+            }
+            _ => calculate_forward_direction(body_spine, root_index),
+        };
         let backward_angle_radians = (-forward_direction[1]).atan2(-forward_direction[0]);
         for (side_index, (body_side, direction_offsets)) in [-1.0, 1.0]
             .into_iter()
@@ -1238,6 +1263,23 @@ fn calculate_body_half_width(along_fraction: f64, koi_anatomy: &KoiAnatomy) -> f
         .max(TAIL_WIDTH_FRACTION)
     };
     koi_anatomy.body_width_pixels / 2.0 * width_fraction
+}
+
+/// The way the tail's stalk points, read over a long stretch of the body. A long fin swings
+/// on this angle, so measuring it over a few pixels would make the tip snap about.
+fn calculate_tail_stalk_direction(curve_points: &[CurvePoint], point_index: usize) -> [f64; 2] {
+    const STALK_SAMPLES: usize = 18;
+    let earlier_point = curve_points[point_index.saturating_sub(STALK_SAMPLES)].position;
+    let root_point = curve_points[point_index].position;
+    let tangent = [
+        earlier_point[0] - root_point[0],
+        earlier_point[1] - root_point[1],
+    ];
+    let tangent_length_pixels = tangent[0].hypot(tangent[1]);
+    [
+        tangent[0] / tangent_length_pixels,
+        tangent[1] / tangent_length_pixels,
+    ]
 }
 
 fn calculate_forward_direction(curve_points: &[CurvePoint], point_index: usize) -> [f64; 2] {
