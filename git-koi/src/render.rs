@@ -85,7 +85,7 @@ pub fn render_swim_frame(
     let koi_anatomy = calculate_anatomy(koi_development.total_contributions);
     let swim_pose = calculate_swim_pose(behavior, frame_index);
     let pose_center = match swim_pose.course {
-        Course::Lap { .. } | Course::Stadium { .. } => [0.0, 0.0],
+        Course::Lap { .. } | Course::Meander { .. } => [0.0, 0.0],
         Course::Hover { drift_pixels, .. } => {
             let hover_fit = fit_hover_loop(behavior, &koi_anatomy);
             [0, 1].map(|axis_index| {
@@ -105,7 +105,7 @@ pub fn render_swim_frame(
 
 /// Render the koi in any pose on the square canvas, returning the frame and the whole
 /// pixels to add to a canvas position to reach the scene it belongs to. World positions
-/// plus `world_offset` are scene positions, so a stadium pose lands on its own track.
+/// plus `world_offset` are scene positions, so a meander pose lands on its own path.
 pub(crate) fn render_placed_koi(
     koi_development: &KoiDevelopment,
     koi_body: KoiBody,
@@ -174,7 +174,7 @@ fn fit_hover_loop(behavior: Behavior, koi_anatomy: &KoiAnatomy) -> HoverFit {
             }
             let drift_pixels = match swim_pose.course {
                 Course::Hover { drift_pixels, .. } => drift_pixels,
-                Course::Lap { .. } | Course::Stadium { .. } => [0.0; 2],
+                Course::Lap { .. } | Course::Meander { .. } => [0.0; 2],
             };
             ([min_corner, max_corner], drift_pixels)
         })
@@ -798,15 +798,24 @@ fn build_spine(koi_anatomy: &KoiAnatomy, swim_pose: &SwimPose) -> Vec<CurvePoint
             }
             center_points
         }
-        Course::Stadium {
-            stadium,
-            distance_pixels,
-        } => (0..point_count)
-            .map(|point_index| CurvePoint {
-                position: stadium.calculate_point(distance_pixels - point_index as f64),
-                half_width_pixels: calculate_point_half_width(point_index),
-            })
-            .collect(),
+        // Walk back along the path, one pixel of arc per body point.
+        Course::Meander {
+            meander,
+            phase_radians,
+        } => {
+            let mut point_phase = phase_radians;
+            (0..point_count)
+                .map(|point_index| {
+                    let curve_point = CurvePoint {
+                        position: meander.calculate_point(point_phase),
+                        half_width_pixels: calculate_point_half_width(point_index),
+                    };
+                    let [velocity_x, velocity_y] = meander.calculate_velocity(point_phase);
+                    point_phase -= 1.0 / velocity_x.hypot(velocity_y).max(1.0);
+                    curve_point
+                })
+                .collect()
+        }
         // Each body point sits one pixel of arc behind the one in front.
         Course::Lap { angle_radians } => {
             let radius_pixels = calculate_lap_radius(body_length_pixels);
