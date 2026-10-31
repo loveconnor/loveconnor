@@ -32,3 +32,4 @@ pub mod motion;
 pub mod output;
 pub mod pond;
 pub mod render;
+mod school;

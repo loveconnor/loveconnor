@@ -3,10 +3,10 @@
 //! The pool floor is the last year's contribution graph as a mosaic. A fry swims for
 //! each language, in GitHub's color for it. Pellets are the last seven days'
 //! contributions, and the koi eats them as it passes. A lily pad floats for each year
-//! on GitHub, and they bloom while a weekly streak runs. Every fish wanders its own path,
-//! chosen from the account's ID, and the koi still moves as the day's [`Behavior`] says.
-//! Identical inputs produce identical pixels without I/O or
-//! clock reads, and every frame count closes the loop seamlessly.
+//! on GitHub, and they bloom while a weekly streak runs. [`crate::school`] decides how
+//! the fish behave, and the koi still moves as the day's [`Behavior`] says. Identical
+//! inputs produce identical pixels without I/O or clock reads, and every frame count
+//! closes the loop seamlessly.
 
 use std::f64::consts::{PI, TAU};
 
@@ -16,8 +16,11 @@ use crate::behavior::{Behavior, select_behavior};
 use crate::coat::KoiBody;
 use crate::history::{AccountSnapshot, summarize_contributions};
 use crate::koi::{KoiDevelopment, KoiDevelopmentError, RecentStreak, derive_koi_development};
-use crate::motion::{Course, Meander, MeanderWave, SwimPose, calculate_swim_pose};
-use crate::render::{FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, render_placed_koi};
+use crate::motion::{Course, calculate_swim_pose};
+use crate::render::{
+    FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, calculate_koi_body_length, render_placed_koi,
+};
+use crate::school::{FryPlace, KoiMotion, PelletLife, School, SchoolSetup, simulate_school};
 
 /// Width of the native scene; exports scale it up exactly.
 pub const POND_WIDTH_PIXELS: u32 = 520;
@@ -26,12 +29,14 @@ pub const POND_HEIGHT_PIXELS: u32 = 208;
 
 const WIDTH: i32 = POND_WIDTH_PIXELS as i32;
 const HEIGHT: i32 = POND_HEIGHT_PIXELS as i32;
-/// Three cruise or dart pose loops, and a whole number of every resting pose loop, so
-/// each loop is long enough that the paths do not read as a repeating pattern.
-const LOOP_FRAMES: u32 = 360;
-/// Tries per path; the same account always gets the same choice.
-const PATH_CANDIDATES: u64 = 600;
-const PATH_SAMPLES: usize = 1_440;
+/// Whole numbers of cruise, dart, and deep rest pose loops, long enough that the koi
+/// can get well away from where it starts and come back.
+const SWIM_LOOP_FRAMES: usize = 480;
+/// A whole number of rest pose loops.
+const REST_LOOP_FRAMES: usize = 360;
+/// Points kept of the koi's trail per frame, one pixel apart; the longest koi fits.
+const KOI_TRAIL_POINTS: usize = 280;
+const HOVER_HEAD: [i32; 2] = [320, 104];
 
 const MOSAIC_WEEKS: i32 = 53;
 const MOSAIC_DAYS: i32 = 7;
@@ -56,8 +61,7 @@ const SHADOW_STRENGTH: f64 = 0.68;
 
 const MAX_FRY: usize = 12;
 const MAX_PELLETS: u64 = 24;
-/// Frames a pellet floats before the koi arrives, and how long its ripples last.
-const PELLET_FLOAT_FRAMES: u32 = 80;
+/// How long a pellet's ripples last.
 const RIPPLE_FRAMES: u32 = 16;
 const MOUTH_OPEN_FRAMES: u32 = 10;
 const SPARKLE_COUNT: u32 = 26;
@@ -85,33 +89,14 @@ pub struct Pond {
     background: Vec<[u8; 4]>,
     /// The still lily pads, which float above everything that swims.
     canopy: Vec<[u8; 4]>,
-    koi_phases: Vec<f64>,
-    koi_meander: Meander,
-    fry: Vec<Fry>,
-    pellets: Vec<Pellet>,
+    fry_looks: Vec<FryLook>,
+    school: School,
     sparkles: Vec<Sparkle>,
 }
 
-struct Fry {
+struct FryLook {
     colors: [[u8; 4]; 3],
     length_pixels: f64,
-    /// Each frame's center, heading, turn, and tail swing.
-    track: Vec<FryPlace>,
-}
-
-#[derive(Clone, Copy)]
-struct FryPlace {
-    center: [f64; 2],
-    forward: [f64; 2],
-    turn_radians: f64,
-    wag: f64,
-}
-
-struct Pellet {
-    position: [f64; 2],
-    /// The frame the koi reaches it; `None` when the koi is resting and leaves it afloat.
-    eaten_at: Option<u32>,
-    phase_frames: u32,
 }
 
 struct Sparkle {
@@ -188,62 +173,34 @@ impl Pond {
             .collect();
         language_shares.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(right.0)));
         language_shares.truncate(MAX_FRY);
-        let mut fry: Vec<Fry> = Vec::new();
-        for (fry_index, (name, share)) in language_shares.iter().enumerate() {
-            let color = koi_development
-                .language_colors
-                .get(*name)
-                .copied()
-                .flatten()
-                .map_or([170, 180, 190], |language_color| language_color.0);
-            // Every fourth fry trails the one before it, so small schools form and part.
-            let track = if fry_index % 4 == 3 {
-                calculate_follower_track(&fry[fry_index - 1].track, fry_index)
-            } else {
-                calculate_fry_track(seed, fry_index as u64)
-            };
-            fry.push(Fry {
-                colors: shade_fry(color),
-                length_pixels: 15.0 + 13.0 * share.sqrt(),
-                track,
-            });
-        }
-
-        let koi_meander = choose_meander(seed, &KOI_PATH);
-        let koi_phases = calculate_koi_phases(behavior, &koi_meander, seed);
-
-        let frame_count = LOOP_FRAMES;
-        let pellet_count = koi_development
-            .recent_activity
-            .recent_contributions
-            .min(MAX_PELLETS) as u32;
-        let pellets = (0..pellet_count)
-            .map(|pellet_index| {
-                let eat_frame = (pellet_index * frame_count + frame_count / 2) / pellet_count;
-                let jitter = hash(seed, u64::from(pellet_index));
-                if is_resting(behavior) {
-                    Pellet {
-                        position: [
-                            40.0 + (jitter % 440) as f64,
-                            22.0 + ((jitter >> 16) % 164) as f64,
-                        ],
-                        eaten_at: None,
-                        phase_frames: eat_frame,
-                    }
-                } else {
-                    let [x, y] =
-                        calculate_mouth_point(&koi_meander, koi_phases[eat_frame as usize]);
-                    Pellet {
-                        position: [
-                            x + (jitter % 5) as f64 - 2.0,
-                            y + ((jitter >> 8) % 5) as f64 - 2.0,
-                        ],
-                        eaten_at: Some(eat_frame),
-                        phase_frames: eat_frame,
-                    }
+        let fry_looks: Vec<FryLook> = language_shares
+            .iter()
+            .map(|(name, share)| {
+                let color = koi_development
+                    .language_colors
+                    .get(*name)
+                    .copied()
+                    .flatten()
+                    .map_or([170, 180, 190], |language_color| language_color.0);
+                FryLook {
+                    colors: shade_fry(color),
+                    length_pixels: 15.0 + 13.0 * share.sqrt(),
                 }
             })
             .collect();
+
+        let frame_count = calculate_frame_count(behavior) as u32;
+        let school = simulate_school(&SchoolSetup {
+            seed,
+            frame_count: frame_count as usize,
+            fry_lengths: fry_looks.iter().map(|look| look.length_pixels).collect(),
+            pellet_count: koi_development
+                .recent_activity
+                .recent_contributions
+                .min(MAX_PELLETS) as u32,
+            koi_body_length: calculate_koi_body_length(koi_development.total_contributions),
+            koi_motion: calculate_koi_motion(behavior, frame_count),
+        });
 
         let sparkles = (0..SPARKLE_COUNT)
             .map(|sparkle_index| {
@@ -264,27 +221,109 @@ impl Pond {
             behavior,
             background,
             canopy,
-            koi_phases,
-            koi_meander,
-            fry,
-            pellets,
+            fry_looks,
+            school,
             sparkles,
         })
     }
 
     /// Frames in the pond's loop.
     pub fn frame_count(&self) -> u32 {
-        LOOP_FRAMES
+        calculate_frame_count(self.behavior) as u32
     }
 
     /// The fry swimming today, one per language up to the limit.
     pub fn fry_count(&self) -> usize {
-        self.fry.len()
+        self.fry_looks.len()
     }
 
     /// The pellets in the pond today.
     pub fn pellet_count(&self) -> usize {
-        self.pellets.len()
+        self.school.pellets.len()
+    }
+
+    /// The smallest distance any two fry's mouths and bodies come within each other over
+    /// the loop, measured between the circles that cover them; negative means they touched.
+    pub fn closest_fry_gap(&self) -> f64 {
+        let mut closest = f64::INFINITY;
+        for frame in 0..self.frame_count() as usize {
+            let circles: Vec<([f64; 2], f64)> = self
+                .school
+                .fry
+                .iter()
+                .zip(&self.fry_looks)
+                .map(|(track, look)| {
+                    let place = track[frame];
+                    (
+                        [
+                            place.head[0] - place.forward[0] * look.length_pixels * 0.7,
+                            place.head[1] - place.forward[1] * look.length_pixels * 0.7,
+                        ],
+                        look.length_pixels * 0.6,
+                    )
+                })
+                .collect();
+            for (first_index, first) in circles.iter().enumerate() {
+                for second in &circles[first_index + 1..] {
+                    let gap = (first.0[0] - second.0[0]).hypot(first.0[1] - second.0[1])
+                        - first.1
+                        - second.1;
+                    closest = closest.min(gap);
+                }
+            }
+        }
+        closest
+    }
+
+    /// The smallest distance between any fry and the koi's spine over the loop, in native
+    /// pixels, measured from the middle of the fry; zero for a resting koi, which stays put.
+    pub fn closest_fry_to_koi(&self) -> f64 {
+        if is_resting(self.behavior) {
+            return 0.0;
+        }
+        let mut closest = f64::INFINITY;
+        for frame in 0..self.frame_count() as usize {
+            let trail = self.calculate_koi_trail(frame);
+            let body_length = calculate_koi_body_length(self.koi_development.total_contributions);
+            for (track, look) in self.school.fry.iter().zip(&self.fry_looks) {
+                let place = track[frame];
+                let middle = [
+                    place.head[0] - place.forward[0] * look.length_pixels * 0.5,
+                    place.head[1] - place.forward[1] * look.length_pixels * 0.5,
+                ];
+                for point in trail.iter().take(body_length as usize) {
+                    closest = closest.min((point[0] - middle[0]).hypot(point[1] - middle[1]));
+                }
+            }
+        }
+        closest
+    }
+
+    /// The farthest any fry moves in one frame, in native pixels.
+    pub fn fastest_fry_step(&self) -> f64 {
+        self.school
+            .fry
+            .iter()
+            .flat_map(|track| {
+                (0..track.len()).map(|frame| {
+                    let here = track[frame].head;
+                    let next = track[(frame + 1) % track.len()].head;
+                    (next[0] - here[0]).hypot(next[1] - here[1])
+                })
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// How many pellets the koi ate, how many the fry ate, and how many sank uneaten.
+    pub fn pellets_eaten_by(&self) -> (usize, usize, usize) {
+        let pellets = &self.school.pellets;
+        let koi_count = pellets.iter().filter(|pellet| pellet.eaten_by_koi).count();
+        let sunk_count = pellets.iter().filter(|pellet| pellet.sank).count();
+        (
+            koi_count,
+            pellets.len() - koi_count - sunk_count,
+            sunk_count,
+        )
     }
 
     /// One frame's pixels, row by row from the top left. Frame numbers wrap around the
@@ -297,11 +336,11 @@ impl Pond {
             draw_sparkle(&mut pixels, sparkle, frame, frame_count);
         }
         let mut swim_mask = vec![false; pixels.len()];
-        for fry in &self.fry {
-            draw_fry(&mut pixels, &mut swim_mask, fry, frame);
+        for pellet in &self.school.pellets {
+            draw_pellet(&mut pixels, pellet, frame);
         }
-        for pellet in &self.pellets {
-            draw_pellet(&mut pixels, pellet, frame, frame_count);
+        for (look, track) in self.fry_looks.iter().zip(&self.school.fry) {
+            draw_fry(&mut pixels, &mut swim_mask, look, track[frame as usize]);
         }
         self.draw_koi(&mut pixels, &mut swim_mask, frame);
         for (pixel, canopy_pixel) in pixels.iter_mut().zip(&self.canopy) {
@@ -312,38 +351,71 @@ impl Pond {
         pixels
     }
 
+    /// Points one pixel apart back along the koi's trail from a frame's head position,
+    /// wrapping around the loop so the body carries across the restart.
+    fn calculate_koi_trail(&self, frame: usize) -> Vec<[f64; 2]> {
+        let heads = &self.school.koi_heads;
+        let mut trail = Vec::with_capacity(KOI_TRAIL_POINTS);
+        let mut point = heads[frame];
+        let mut wanted = 0.0;
+        let mut covered = 0.0;
+        trail.push(point);
+        wanted += 1.0;
+        for step_back in 1..heads.len() {
+            let earlier = heads[(frame + heads.len() - step_back) % heads.len()];
+            let step = (earlier[0] - point[0]).hypot(earlier[1] - point[1]);
+            while covered + step >= wanted && trail.len() < KOI_TRAIL_POINTS {
+                let within = (wanted - covered) / step.max(1e-9);
+                trail.push([
+                    point[0] + (earlier[0] - point[0]) * within,
+                    point[1] + (earlier[1] - point[1]) * within,
+                ]);
+                wanted += 1.0;
+            }
+            covered += step;
+            point = earlier;
+            if trail.len() == KOI_TRAIL_POINTS {
+                break;
+            }
+        }
+        trail
+    }
+
     fn draw_koi(&self, pixels: &mut [[u8; 4]], swim_mask: &mut [bool], frame: u32) {
-        let (mut swim_pose, world_offset) = if is_resting(self.behavior) {
-            // The body trails left of the head, so the head rests right of center.
-            let pose = calculate_swim_pose(self.behavior, frame);
-            (pose, [320, 104])
+        let resting = is_resting(self.behavior);
+        let mut swim_pose = if resting {
+            calculate_swim_pose(self.behavior, frame)
         } else {
-            (
-                calculate_meander_pose(
-                    self.behavior,
-                    frame,
-                    self.koi_meander,
-                    self.koi_phases[frame as usize],
-                ),
-                [0, 0],
-            )
+            let lap_behavior = if self.behavior == Behavior::Dart {
+                Behavior::Dart
+            } else {
+                Behavior::Cruise
+            };
+            crate::motion::SwimPose {
+                course: Course::Trail,
+                ..calculate_swim_pose(lap_behavior, frame)
+            }
         };
         if let Some(gap) = self
+            .school
             .pellets
             .iter()
-            .filter_map(|pellet| pellet.eaten_at)
-            .map(|eaten_at| (eaten_at + self.frame_count() - frame) % self.frame_count())
+            .filter(|pellet| pellet.eaten_by_koi && pellet.gone_at >= frame)
+            .map(|pellet| pellet.gone_at - frame)
             .min()
             && gap < MOUTH_OPEN_FRAMES
         {
             let opening = 1.0 - f64::from(gap) / f64::from(MOUTH_OPEN_FRAMES);
             swim_pose.mouth_opening = swim_pose.mouth_opening.max(opening);
         }
+        let koi_trail = (!resting).then(|| self.calculate_koi_trail(frame as usize));
+        let world_offset = if resting { HOVER_HEAD } else { [0, 0] };
         let (koi_frame, scene_offset) = render_placed_koi(
             &self.koi_development,
             self.koi_body,
             &swim_pose,
             world_offset,
+            koi_trail.as_deref(),
         );
         let koi_pixels = koi_frame.as_rgba_bytes().as_chunks::<4>().0;
         let visit = |visitor: &mut dyn FnMut(i32, i32, [u8; 4])| {
@@ -373,353 +445,46 @@ impl Pond {
     }
 }
 
+fn calculate_frame_count(behavior: Behavior) -> usize {
+    if behavior == Behavior::Rest {
+        REST_LOOP_FRAMES
+    } else {
+        SWIM_LOOP_FRAMES
+    }
+}
+
 fn is_resting(behavior: Behavior) -> bool {
     matches!(behavior, Behavior::Rest | Behavior::DeepRest)
 }
 
-/// The range a path may be drawn from and must stay inside.
-struct PathLimits {
-    /// Allowed head positions: left, top, right, bottom.
-    bounds: [f64; 4],
-    center_x_range: [f64; 2],
-    /// Lowest and highest amplitude of each wave, by axis then wave.
-    amplitude_ranges: [[[f64; 2]; 3]; 2],
-    /// The tightest turn the fish can make without its body folding.
-    min_radius_pixels: f64,
-    salt: u64,
-}
-
-/// The koi has the length of a body to bring around each turn, so it turns wide.
-const KOI_PATH: PathLimits = PathLimits {
-    bounds: [78.0, 42.0, 442.0, 166.0],
-    center_x_range: [245.0, 275.0],
-    amplitude_ranges: [
-        [[110.0, 165.0], [10.0, 45.0], [0.0, 20.0]],
-        [[18.0, 50.0], [10.0, 38.0], [0.0, 14.0]],
-    ],
-    min_radius_pixels: 44.0,
-    salt: 0x6b6f69,
-};
-
-fn fry_path(fry_index: u64) -> PathLimits {
-    PathLimits {
-        bounds: [24.0, 22.0, 496.0, 186.0],
-        center_x_range: [110.0, 410.0],
-        amplitude_ranges: [
-            [[40.0, 170.0], [10.0, 70.0], [0.0, 30.0]],
-            [[15.0, 70.0], [5.0, 45.0], [0.0, 22.0]],
-        ],
-        min_radius_pixels: 13.0,
-        salt: 0x667279 + fry_index,
-    }
-}
-
-/// Choose the valid candidate that covers the most water, so the same account always
-/// swims the same way. A plain oval is the fallback, though none has needed it.
-fn choose_meander(seed: u64, limits: &PathLimits) -> Meander {
-    let mut best: Option<(f64, Meander)> = None;
-    for candidate_index in 0..PATH_CANDIDATES {
-        let mut draw_count = 0;
-        let mut draw = |low: f64, high: f64| {
-            draw_count += 1;
-            let mixed = hash(seed ^ limits.salt, candidate_index << 8 | draw_count);
-            low + (high - low) * (mixed % 65_536) as f64 / 65_535.0
+/// What the simulation should do with the koi. A swimming koi's speed follows its
+/// strokes, surging on each beat and coasting through the glide. Surface feeding swims
+/// too: the pond's food comes to it.
+fn calculate_koi_motion(behavior: Behavior, frame_count: u32) -> KoiMotion {
+    if is_resting(behavior) {
+        return KoiMotion::Hovering {
+            head: HOVER_HEAD.map(f64::from),
+            backward_angle: PI - 0.08,
         };
-        let center = [
-            draw(limits.center_x_range[0], limits.center_x_range[1]),
-            104.0,
-        ];
-        let mut waves = [[MeanderWave {
-            amplitude_pixels: 0.0,
-            phase_radians: 0.0,
-        }; 3]; 2];
-        for axis_index in 0..2 {
-            for wave_index in 0..3 {
-                let [low, high] = limits.amplitude_ranges[axis_index][wave_index];
-                waves[axis_index][wave_index] = MeanderWave {
-                    amplitude_pixels: draw(low, high),
-                    phase_radians: draw(0.0, TAU),
-                };
-            }
-        }
-        let meander = Meander { center, waves };
-        if let Some(score) = score_meander(&meander, limits)
-            && best
-                .as_ref()
-                .is_none_or(|(best_score, _)| score > *best_score)
-        {
-            best = Some((score, meander));
-        }
     }
-    best.map_or_else(
-        || Meander {
-            center: [260.0, 104.0],
-            waves: [
-                [
-                    MeanderWave {
-                        amplitude_pixels: 150.0,
-                        phase_radians: 0.0,
-                    },
-                    QUIET_WAVE,
-                    QUIET_WAVE,
-                ],
-                [
-                    MeanderWave {
-                        amplitude_pixels: 50.0,
-                        phase_radians: PI / 2.0,
-                    },
-                    QUIET_WAVE,
-                    QUIET_WAVE,
-                ],
-            ],
-        },
-        |(_, meander)| meander,
-    )
-}
-
-const QUIET_WAVE: MeanderWave = MeanderWave {
-    amplitude_pixels: 0.0,
-    phase_radians: 0.0,
-};
-
-/// How much water a path visits and how often it changes which way it is turning, or
-/// `None` if it leaves its bounds or turns too tightly.
-fn score_meander(meander: &Meander, limits: &PathLimits) -> Option<f64> {
-    const COARSE_SAMPLES: usize = 360;
-    const VISIT_CELL_PIXELS: f64 = 24.0;
-    let [left, top, right, bottom] = limits.bounds;
-    let step = TAU / COARSE_SAMPLES as f64;
-    let mut visited = std::collections::BTreeSet::new();
-    let mut turn_changes = 0;
-    let mut previous_turn = 0.0;
-    for sample_index in 0..COARSE_SAMPLES {
-        let phase = sample_index as f64 * step;
-        let [x, y] = meander.calculate_point(phase);
-        if x < left || x > right || y < top || y > bottom {
-            return None;
-        }
-        let velocity = meander.calculate_velocity(phase);
-        let next_velocity = meander.calculate_velocity(phase + step);
-        let speed = velocity[0].hypot(velocity[1]);
-        let acceleration = [
-            (next_velocity[0] - velocity[0]) / step,
-            (next_velocity[1] - velocity[1]) / step,
-        ];
-        let turn = velocity[0] * acceleration[1] - velocity[1] * acceleration[0];
-        if turn * previous_turn < 0.0 {
-            turn_changes += 1;
-        }
-        previous_turn = turn;
-        if speed.powi(3) < limits.min_radius_pixels * turn.abs() {
-            return None;
-        }
-        visited.insert((
-            (x / VISIT_CELL_PIXELS) as i32,
-            (y / VISIT_CELL_PIXELS) as i32,
-        ));
-    }
-    // A bend the other way is worth far more than a little extra water: it is what keeps
-    // a path from reading as a lap.
-    Some(visited.len() as f64 + 12.0 * f64::from(turn_changes))
-}
-
-/// Each sample's share of the way around the path by distance, so a fish can move at the
-/// speed it chooses however the waves bunch up.
-fn measure_path_shares(meander: &Meander) -> Vec<f64> {
-    let mut distances = Vec::with_capacity(PATH_SAMPLES + 1);
-    let mut covered = 0.0;
-    let mut previous = meander.calculate_point(0.0);
-    distances.push(0.0);
-    for sample_index in 1..=PATH_SAMPLES {
-        let point = meander.calculate_point(TAU * sample_index as f64 / PATH_SAMPLES as f64);
-        covered += (point[0] - previous[0]).hypot(point[1] - previous[1]);
-        previous = point;
-        distances.push(covered);
-    }
-    distances
-        .iter()
-        .map(|distance| distance / covered)
-        .collect()
-}
-
-/// The phase a share of the distance around the path falls at.
-fn phase_at_share(path_shares: &[f64], share: f64) -> f64 {
-    let whole_laps = share.floor();
-    let wanted = share - whole_laps;
-    let sample = path_shares
-        .partition_point(|covered| *covered < wanted)
-        .max(1);
-    let (below, above) = (path_shares[sample - 1], path_shares[sample]);
-    let within = (wanted - below) / (above - below).max(1e-12);
-    TAU * (whole_laps + (sample as f64 - 1.0 + within) / PATH_SAMPLES as f64)
-}
-
-/// Turn frame-by-frame speeds into each frame's phase, covering whole laps exactly.
-fn phases_from_speeds(
-    meander: &Meander,
-    speeds: &[f64],
-    lap_count: f64,
-    start_share: f64,
-) -> Vec<f64> {
-    let path_shares = measure_path_shares(meander);
-    let total_speed: f64 = speeds.iter().sum();
-    let mut covered_speed = 0.0;
-    speeds
-        .iter()
-        .map(|speed| {
-            let share = start_share + lap_count * covered_speed / total_speed;
-            covered_speed += speed;
-            phase_at_share(&path_shares, share)
-        })
-        .collect()
-}
-
-/// The koi's phase per frame. Its strokes set the pace, and it also eases up and picks
-/// up speed over the loop, as though it had somewhere to be and then did not. A cruise
-/// wanders one lap, a dart two.
-fn calculate_koi_phases(behavior: Behavior, meander: &Meander, seed: u64) -> Vec<f64> {
-    let lap_behavior = calculate_lap_behavior(behavior);
+    let dart = behavior == Behavior::Dart;
+    let lap_behavior = if dart {
+        Behavior::Dart
+    } else {
+        Behavior::Cruise
+    };
     let lap_angle = |frame: u32| match calculate_swim_pose(lap_behavior, frame).course {
         Course::Lap { angle_radians } => angle_radians,
         _ => unreachable!("lap styles swim laps"),
     };
-    let ease_phase = (hash(seed, 0x65617365) % 628) as f64 / 100.0;
-    let speeds: Vec<f64> = (0..LOOP_FRAMES)
-        .map(|frame| {
-            let stroke_speed = (lap_angle(frame + 1) - lap_angle(frame)).rem_euclid(TAU);
-            let progress = f64::from(frame) / f64::from(LOOP_FRAMES);
-            stroke_speed
-                * (1.0
-                    + 0.28 * (TAU * 2.0 * progress + ease_phase).sin()
-                    + 0.14 * (TAU * 5.0 * progress + ease_phase * 2.0).sin())
-        })
+    let steps: Vec<f64> = (0..frame_count)
+        .map(|frame| (lap_angle(frame + 1) - lap_angle(frame)).rem_euclid(TAU))
         .collect();
-    let lap_count = if behavior == Behavior::Dart { 2.0 } else { 1.0 };
-    phases_from_speeds(meander, &speeds, lap_count, 0.0)
-}
-
-fn calculate_lap_behavior(behavior: Behavior) -> Behavior {
-    if behavior == Behavior::Dart {
-        Behavior::Dart
-    } else {
-        Behavior::Cruise
+    let mean_step = steps.iter().sum::<f64>() / steps.len() as f64;
+    KoiMotion::Swimming {
+        dart,
+        surges: steps.iter().map(|step| step / mean_step).collect(),
     }
-}
-
-/// A pose on the koi's path. Surface feeding swims too: the pond's food comes to it.
-fn calculate_meander_pose(
-    behavior: Behavior,
-    frame: u32,
-    meander: Meander,
-    phase_radians: f64,
-) -> SwimPose {
-    SwimPose {
-        course: Course::Meander {
-            meander,
-            phase_radians,
-        },
-        ..calculate_swim_pose(calculate_lap_behavior(behavior), frame)
-    }
-}
-
-/// Just ahead of the head along the path, where a pellet meets the mouth.
-fn calculate_mouth_point(meander: &Meander, phase_radians: f64) -> [f64; 2] {
-    const MOUTH_REACH_PIXELS: f64 = 4.0;
-    let [velocity_x, velocity_y] = meander.calculate_velocity(phase_radians);
-    meander
-        .calculate_point(phase_radians + MOUTH_REACH_PIXELS / velocity_x.hypot(velocity_y).max(1.0))
-}
-
-/// A fry wanders its own path in bursts: quick flicks of the tail, then a long glide.
-fn calculate_fry_track(seed: u64, fry_index: u64) -> Vec<FryPlace> {
-    const TAIL_BEATS_PER_LOOP: f64 = 46.0;
-    let meander = choose_meander(seed, &fry_path(fry_index));
-    let mixed = hash(seed ^ 0x6275, fry_index);
-    let burst_count = 3.0 + (mixed % 5) as f64;
-    let burst_phase = ((mixed >> 8) % 628) as f64 / 100.0;
-    let start_share = ((mixed >> 20) % 1_000) as f64 / 1_000.0;
-    let speeds: Vec<f64> = (0..LOOP_FRAMES)
-        .map(|frame| {
-            let progress = f64::from(frame) / f64::from(LOOP_FRAMES);
-            let burst = (TAU * burst_count * progress + burst_phase).sin().max(0.0);
-            0.22 + 1.9 * burst.powi(3)
-        })
-        .collect();
-    let total_speed: f64 = speeds.iter().sum();
-    let phases = phases_from_speeds(&meander, &speeds, 1.0, start_share);
-    let points: Vec<[f64; 2]> = phases
-        .iter()
-        .map(|phase| meander.calculate_point(*phase))
-        .collect();
-    let mut covered_speed = 0.0;
-    let wags: Vec<f64> = speeds
-        .iter()
-        .map(|speed| {
-            let wag = (TAU * TAIL_BEATS_PER_LOOP * covered_speed / total_speed).sin();
-            covered_speed += speed;
-            wag
-        })
-        .collect();
-    (0..LOOP_FRAMES as usize)
-        .map(|frame| {
-            let forward = normalize(meander.calculate_velocity(phases[frame]));
-            FryPlace {
-                center: points[frame],
-                forward,
-                turn_radians: 0.0,
-                wag: wags[frame],
-            }
-        })
-        .collect::<Vec<_>>()
-        .with_turns()
-}
-
-/// A fry that follows another a little behind and to one side, swaying on its own.
-fn calculate_follower_track(leader: &[FryPlace], fry_index: usize) -> Vec<FryPlace> {
-    let frame_total = leader.len();
-    let lag_frames = 16 + fry_index % 3 * 6;
-    let side_pixels = if fry_index % 8 == 3 { 9.0 } else { -11.0 };
-    (0..frame_total)
-        .map(|frame| {
-            let place = leader[(frame + frame_total - lag_frames) % frame_total];
-            let progress = frame as f64 / frame_total as f64;
-            let sway = side_pixels + 4.0 * (TAU * 7.0 * progress).sin();
-            FryPlace {
-                center: [
-                    place.center[0] - place.forward[1] * sway,
-                    place.center[1] + place.forward[0] * sway,
-                ],
-                ..place
-            }
-        })
-        .collect()
-}
-
-trait WithTurns {
-    fn with_turns(self) -> Vec<FryPlace>;
-}
-
-impl WithTurns for Vec<FryPlace> {
-    /// Fill in how sharply each fry is turning, from its heading a moment ago, so the
-    /// body curves into a turn instead of pivoting like a compass needle.
-    fn with_turns(mut self) -> Vec<FryPlace> {
-        const TURN_LOOKBACK_FRAMES: usize = 7;
-        let frame_total = self.len();
-        let headings: Vec<f64> = self
-            .iter()
-            .map(|place| place.forward[1].atan2(place.forward[0]))
-            .collect();
-        for frame in 0..frame_total {
-            let earlier = headings[(frame + frame_total - TURN_LOOKBACK_FRAMES) % frame_total];
-            self[frame].turn_radians = (headings[frame] - earlier + PI).rem_euclid(TAU) - PI;
-        }
-        self
-    }
-}
-
-fn normalize([x, y]: [f64; 2]) -> [f64; 2] {
-    let length = x.hypot(y).max(1e-9);
-    [x / length, y / length]
 }
 
 /// Counts at which a tile reaches each shade above empty: any activity, then the
@@ -921,9 +686,8 @@ fn shade_fry(color: [u8; 3]) -> [[u8; 4]; 3] {
     [mix(255.0, 0.45), mix(0.0, 0.0), mix(0.0, 0.4)]
 }
 
-fn draw_fry(pixels: &mut [[u8; 4]], swim_mask: &mut [bool], fry: &Fry, frame: u32) {
-    let place = fry.track[frame as usize];
-    let (center, forward) = (place.center, place.forward);
+fn draw_fry(pixels: &mut [[u8; 4]], swim_mask: &mut [bool], fry: &FryLook, place: FryPlace) {
+    let (center, forward) = (place.head, place.forward);
     let wag = place.wag;
     let length = fry.length_pixels;
     let half_width = (length * 0.24).max(3.0);
@@ -937,7 +701,9 @@ fn draw_fry(pixels: &mut [[u8; 4]], swim_mask: &mut [bool], fry: &Fry, frame: u3
             let along = -(offset[0] * forward[0] + offset[1] * forward[1]);
             let across = -offset[0] * forward[1] + offset[1] * forward[0];
             let bend_share = (along / (length + tail_length)).clamp(0.0, 1.0).powi(2);
-            let bend = bend_share * (wag * 1.8 - place.turn_radians * length * 0.9);
+            // A hard turn curves the body, but only so far: the fish is short and stiff.
+            let turn_bend = (place.turn_radians * length * 0.9).clamp(-3.5, 3.5);
+            let bend = bend_share * (wag * 1.8 - turn_bend);
             let bent_across = across - bend;
             let body_share = along / length;
             let color = if (0.0..1.0).contains(&body_share) {
@@ -979,7 +745,7 @@ fn draw_fry(pixels: &mut [[u8; 4]], swim_mask: &mut [bool], fry: &Fry, frame: u3
     }
 }
 
-fn draw_pellet(pixels: &mut [[u8; 4]], pellet: &Pellet, frame: u32, frame_count: u32) {
+fn draw_pellet(pixels: &mut [[u8; 4]], pellet: &PelletLife, frame: u32) {
     const PELLET_LIGHT: [u8; 4] = [255, 214, 120, 255];
     const PELLET_DARK: [u8; 4] = [214, 136, 54, 255];
     const RIPPLE: [u8; 4] = [120, 190, 200, 255];
@@ -1001,7 +767,13 @@ fn draw_pellet(pixels: &mut [[u8; 4]], pellet: &Pellet, frame: u32, frame_count:
             );
         }
     };
-    let draw_body = |pixels: &mut [[u8; 4]]| {
+    if frame < pellet.landed_at {
+        return;
+    }
+    if frame < pellet.landed_at + RIPPLE_FRAMES {
+        draw_ripple(pixels, frame - pellet.landed_at);
+    }
+    if frame < pellet.gone_at {
         for dy in -2_i32..=2 {
             for dx in -2_i32..=2 {
                 if dx.abs() + dy.abs() < 4 {
@@ -1012,30 +784,8 @@ fn draw_pellet(pixels: &mut [[u8; 4]], pellet: &Pellet, frame: u32, frame_count:
         for (dx, dy) in [(-1, -1), (0, -1), (-1, 0), (0, 0)] {
             put(pixels, x + dx, y + dy, PELLET_LIGHT);
         }
-    };
-    match pellet.eaten_at {
-        Some(eaten_at) => {
-            let until_eaten = (eaten_at + frame_count - frame) % frame_count;
-            let since_eaten = (frame + frame_count - eaten_at) % frame_count;
-            if until_eaten <= PELLET_FLOAT_FRAMES {
-                let age = PELLET_FLOAT_FRAMES - until_eaten;
-                if age < RIPPLE_FRAMES {
-                    draw_ripple(pixels, age);
-                }
-                if until_eaten > 0 {
-                    draw_body(pixels);
-                }
-            } else if since_eaten < RIPPLE_FRAMES {
-                draw_ripple(pixels, since_eaten);
-            }
-        }
-        None => {
-            draw_body(pixels);
-            let age = (frame + pellet.phase_frames) % frame_count;
-            if age < RIPPLE_FRAMES {
-                draw_ripple(pixels, age);
-            }
-        }
+    } else if frame < pellet.gone_at + RIPPLE_FRAMES {
+        draw_ripple(pixels, frame - pellet.gone_at);
     }
 }
 

@@ -135,66 +135,9 @@ pub enum Course {
         /// How far the koi is moved from the hover center, in native pixels.
         drift_pixels: [f64; 2],
     },
-    /// Along a pond's wandering path, with the body following the path behind the head.
-    /// Positions are the pond's own pixels.
-    Meander {
-        /// The path.
-        meander: Meander,
-        /// Where the head is along it; a whole turn is one lap.
-        phase_radians: f64,
-    },
-}
-
-/// One sine wave in a meander's sum: its height and where it starts.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MeanderWave {
-    /// How far the wave swings, in native pixels.
-    pub amplitude_pixels: f64,
-    /// The wave's phase at the start of the lap.
-    pub phase_radians: f64,
-}
-
-/// A smooth closed path that never quite repeats its own shape within a lap: on each
-/// axis, a sum of waves whose frequencies are whole multiples of one lap.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Meander {
-    /// The point the waves swing around.
-    pub center: [f64; 2],
-    /// Each axis's waves, at one, two, and three cycles per lap.
-    pub waves: [[MeanderWave; 3]; 2],
-}
-
-impl Meander {
-    /// The point at a phase; a whole turn returns to the same point.
-    pub fn calculate_point(&self, phase_radians: f64) -> [f64; 2] {
-        [0, 1].map(|axis_index| {
-            self.center[axis_index]
-                + self.waves[axis_index]
-                    .iter()
-                    .enumerate()
-                    .map(|(wave_index, wave)| {
-                        wave.amplitude_pixels
-                            * ((wave_index + 1) as f64 * phase_radians + wave.phase_radians).sin()
-                    })
-                    .sum::<f64>()
-        })
-    }
-
-    /// Pixels moved per radian of phase, on each axis.
-    pub fn calculate_velocity(&self, phase_radians: f64) -> [f64; 2] {
-        [0, 1].map(|axis_index| {
-            self.waves[axis_index]
-                .iter()
-                .enumerate()
-                .map(|(wave_index, wave)| {
-                    let cycles = (wave_index + 1) as f64;
-                    wave.amplitude_pixels
-                        * cycles
-                        * (cycles * phase_radians + wave.phase_radians).cos()
-                })
-                .sum()
-        })
-    }
+    /// Along a trail the caller supplies, with the body following it behind the head.
+    /// Positions are the scene's own pixels.
+    Trail,
 }
 
 /// How the koi's body and fins look in one frame. Paired values list the left fin,

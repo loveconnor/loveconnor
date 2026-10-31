@@ -65,6 +65,7 @@ pub fn render_koi(koi_development: &KoiDevelopment, koi_body: KoiBody) -> KoiFra
         &koi_anatomy,
         &STILL_POSE,
         Framing::CenterOnKoi,
+        None,
     )
 }
 
@@ -85,7 +86,7 @@ pub fn render_swim_frame(
     let koi_anatomy = calculate_anatomy(koi_development.total_contributions);
     let swim_pose = calculate_swim_pose(behavior, frame_index);
     let pose_center = match swim_pose.course {
-        Course::Lap { .. } | Course::Meander { .. } => [0.0, 0.0],
+        Course::Lap { .. } | Course::Trail => [0.0, 0.0],
         Course::Hover { drift_pixels, .. } => {
             let hover_fit = fit_hover_loop(behavior, &koi_anatomy);
             [0, 1].map(|axis_index| {
@@ -100,20 +101,22 @@ pub fn render_swim_frame(
         &koi_anatomy,
         &swim_pose,
         Framing::At(pose_center),
+        None,
     )
 }
 
 /// Render the koi in any pose on the square canvas, returning the frame and the whole
 /// pixels to add to a canvas position to reach the scene it belongs to. World positions
-/// plus `world_offset` are scene positions, so a meander pose lands on its own path.
+/// plus `world_offset` are scene positions, so a trail pose lands on its own trail.
 pub(crate) fn render_placed_koi(
     koi_development: &KoiDevelopment,
     koi_body: KoiBody,
     swim_pose: &SwimPose,
     world_offset: [i32; 2],
+    body_trail: Option<&[[f64; 2]]>,
 ) -> (KoiFrame, [i32; 2]) {
     let koi_anatomy = calculate_anatomy(koi_development.total_contributions);
-    let body_spine = build_spine(&koi_anatomy, swim_pose);
+    let body_spine = build_spine(&koi_anatomy, swim_pose, body_trail);
     let fin_curves = build_fins(&body_spine, &koi_anatomy, swim_pose);
     let [min_corner, max_corner] = measure_curve_bounds(&body_spine, &fin_curves);
     let frame_sizes = [FRAME_WIDTH_PIXELS, FRAME_HEIGHT_PIXELS];
@@ -130,11 +133,17 @@ pub(crate) fn render_placed_koi(
         &koi_anatomy,
         swim_pose,
         Framing::At(pose_center),
+        body_trail,
     );
     (
         koi_frame,
         [0, 1].map(|axis_index| canvas_offset[axis_index] as i32 + world_offset[axis_index]),
     )
+}
+
+/// The koi's body length at a total, which the pond's fish keep clear of.
+pub(crate) fn calculate_koi_body_length(total_contributions: u64) -> f64 {
+    calculate_anatomy(total_contributions).body_length_pixels
 }
 
 /// Where the view is centered: on the koi itself for the still image, or at a point
@@ -159,7 +168,7 @@ fn fit_hover_loop(behavior: Behavior, koi_anatomy: &KoiAnatomy) -> HoverFit {
     let frame_bounds: Vec<([[f64; 2]; 2], [f64; 2])> = (0..frame_count(behavior))
         .map(|frame_index| {
             let swim_pose = calculate_swim_pose(behavior, frame_index);
-            let body_spine = build_spine(koi_anatomy, &swim_pose);
+            let body_spine = build_spine(koi_anatomy, &swim_pose, None);
             let fin_curves = build_fins(&body_spine, koi_anatomy, &swim_pose);
             let [mut min_corner, mut max_corner] = measure_curve_bounds(&body_spine, &fin_curves);
             // A whisker point covers the pixel to its right and below.
@@ -174,7 +183,7 @@ fn fit_hover_loop(behavior: Behavior, koi_anatomy: &KoiAnatomy) -> HoverFit {
             }
             let drift_pixels = match swim_pose.course {
                 Course::Hover { drift_pixels, .. } => drift_pixels,
-                Course::Lap { .. } | Course::Meander { .. } => [0.0; 2],
+                Course::Lap { .. } | Course::Trail => [0.0; 2],
             };
             ([min_corner, max_corner], drift_pixels)
         })
@@ -222,11 +231,12 @@ fn render_pose(
     koi_anatomy: &KoiAnatomy,
     swim_pose: &SwimPose,
     framing: Framing,
+    body_trail: Option<&[[f64; 2]]>,
 ) -> KoiFrame {
     let koi_coat = KoiCoat::new(koi_development, koi_body, |along_fraction| {
         calculate_body_half_width(along_fraction, koi_anatomy)
     });
-    let body_spine = build_spine(koi_anatomy, swim_pose);
+    let body_spine = build_spine(koi_anatomy, swim_pose, body_trail);
     let fin_curves = build_fins(&body_spine, koi_anatomy, swim_pose);
     let [min_corner, max_corner] = measure_curve_bounds(&body_spine, &fin_curves);
     let pose_center = match framing {
@@ -761,7 +771,11 @@ fn smooth_step(fraction: f64) -> f64 {
 
 /// The spine follows the pose's course: the still pose's fixed heading and gentle bend,
 /// turned by any heading offset, or a clockwise circle around the frame center.
-fn build_spine(koi_anatomy: &KoiAnatomy, swim_pose: &SwimPose) -> Vec<CurvePoint> {
+fn build_spine(
+    koi_anatomy: &KoiAnatomy,
+    swim_pose: &SwimPose,
+    body_trail: Option<&[[f64; 2]]>,
+) -> Vec<CurvePoint> {
     const HEADING_RADIANS: f64 = -0.08;
     const BEND_RADIANS: f64 = 0.35;
     const WAVE_AMPLITUDE_FRACTION: f64 = 0.06;
@@ -798,21 +812,12 @@ fn build_spine(koi_anatomy: &KoiAnatomy, swim_pose: &SwimPose) -> Vec<CurvePoint
             }
             center_points
         }
-        // Walk back along the path, one pixel of arc per body point.
-        Course::Meander {
-            meander,
-            phase_radians,
-        } => {
-            let mut point_phase = phase_radians;
+        Course::Trail => {
+            let trail = body_trail.expect("a trail pose is rendered with its trail");
             (0..point_count)
-                .map(|point_index| {
-                    let curve_point = CurvePoint {
-                        position: meander.calculate_point(point_phase),
-                        half_width_pixels: calculate_point_half_width(point_index),
-                    };
-                    let [velocity_x, velocity_y] = meander.calculate_velocity(point_phase);
-                    point_phase -= 1.0 / velocity_x.hypot(velocity_y).max(1.0);
-                    curve_point
+                .map(|point_index| CurvePoint {
+                    position: trail[point_index.min(trail.len() - 1)],
+                    half_width_pixels: calculate_point_half_width(point_index),
                 })
                 .collect()
         }
@@ -1308,7 +1313,7 @@ mod tests {
     /// Paint only the mouth on an empty canvas centered on it.
     fn paint_mouth_alone(koi_body: KoiBody, mouth_opening: f64) -> Vec<[u8; 4]> {
         let koi_anatomy = calculate_anatomy(1_500);
-        let body_spine = build_spine(&koi_anatomy, &STILL_POSE);
+        let body_spine = build_spine(&koi_anatomy, &STILL_POSE, None);
         let mut rgba_pixels = vec![[0; 4]; (FRAME_WIDTH_PIXELS * FRAME_HEIGHT_PIXELS) as usize];
         let mouth_position = calculate_mouth_position(&body_spine);
         paint_mouth(
