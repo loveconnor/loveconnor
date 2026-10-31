@@ -1,7 +1,7 @@
 //! A wide pond around the koi, built from the rest of the account's activity.
 //!
 //! The pool floor is the last year's contribution graph as a mosaic. A fry swims for
-//! each language, in GitHub's color for it. Pellets are the last seven days'
+//! each of the top languages, in GitHub's color for it. Pellets are the last seven days'
 //! contributions, and the koi eats them as it passes. A lily pad floats for each year
 //! on GitHub, and they bloom while a weekly streak runs. [`crate::school`] decides how
 //! the fish behave, and the koi still moves as the day's [`Behavior`] says. Identical
@@ -61,7 +61,8 @@ const SHORE_WIDTH_PIXELS: f64 = 5.0;
 const SHADOW_OFFSET_PIXELS: i32 = 4;
 const SHADOW_STRENGTH: f64 = 0.68;
 
-const MAX_FRY: usize = 12;
+/// Only the most-used languages get a fry, so the pond never feels crowded.
+const MAX_FRY: usize = 5;
 const MAX_PELLETS: u64 = 24;
 /// How long a pellet's ripples last.
 const RIPPLE_FRAMES: u32 = 26;

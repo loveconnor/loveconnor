@@ -32,7 +32,7 @@ observation date, koi.png is the still koi, and preview.html shows both on light
 dark backgrounds. BODY is white (the default), black, asagi, tea, gold, or platinum.
 The files are replaced only after all of them render.
 Draw a collected SNAPSHOT's whole pond into DIR as pond.gif and pond.png: the koi, its
-contribution graph as a mosaic floor, a fry per language, this week's contributions as
+contribution graph as a mosaic floor, a fry for each top language, this week's contributions as
 food, and a lily pad per year on GitHub.
 Errors go to stderr and exit 1; invalid usage exits 2.
 Examples: git-koi collect octocat --output snapshot.json
