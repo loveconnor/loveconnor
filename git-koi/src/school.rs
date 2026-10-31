@@ -15,7 +15,7 @@ const WATER_BOUNDS: [f64; 4] = [9.0, 9.0, 511.0, 199.0];
 /// nothing has to be pulled into place afterward.
 const ARRIVAL_FRAMES: f64 = 80.0;
 /// The koi turns back before its long body could reach the shore.
-const KOI_BOUNDS: [f64; 4] = [78.0, 50.0, 442.0, 156.0];
+const KOI_BOUNDS: [f64; 4] = [84.0, 62.0, 436.0, 146.0];
 const KOI_TURN_RADIUS_PIXELS: f64 = 34.0;
 const KOI_CRUISE_SPEED: f64 = 2.1;
 const KOI_DART_SPEED: f64 = 3.4;
@@ -161,10 +161,135 @@ fn wall_push(point: [f64; 2], [left, top, right, bottom]: [f64; 4], margin: f64)
     ]
 }
 
-/// Simulate one whole loop and close it.
+/// Swim the loop several ways and keep the best: the koi's whole body stays in the water
+/// and it gets a fair share of the food. The choice is as repeatable as each swim.
 pub(crate) fn simulate_school(setup: &SchoolSetup) -> School {
+    const ATTEMPTS: u64 = 60;
+    let wanted_bites = setup.pellet_count as usize / 3;
+    let mut best: Option<((usize, usize), School)> = None;
+    for attempt in 0..ATTEMPTS {
+        let school = swim_once(
+            setup,
+            setup.seed.wrapping_add(attempt.wrapping_mul(0x1_0001)),
+        );
+        let koi_bites = school
+            .pellets
+            .iter()
+            .filter(|pellet| pellet.eaten_by_koi)
+            .count();
+        let score = (
+            count_frames_out_of_water(setup, &school) + count_frames_touching(setup, &school),
+            wanted_bites.saturating_sub(koi_bites),
+        );
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score < *best_score)
+        {
+            best = Some((score, school));
+        }
+        if score == (0, 0) {
+            break;
+        }
+    }
+    best.expect("at least one attempt ran").1
+}
+
+/// Frames in which two fry touch, or a fry is against the koi's body.
+fn count_frames_touching(setup: &SchoolSetup, school: &School) -> usize {
+    /// How near the koi's spine the middle of a fry may come.
+    const KOI_CLEARANCE_PIXELS: f64 = 24.0;
+    let frame_total = setup.frame_count;
+    let is_swimming = matches!(setup.koi_motion, KoiMotion::Swimming { .. });
+    (0..frame_total)
+        .filter(|frame| {
+            let circles: Vec<([f64; 2], f64)> = school
+                .fry
+                .iter()
+                .zip(&setup.fry_lengths)
+                .map(|(track, length)| {
+                    let place = track[*frame];
+                    (
+                        [
+                            place.head[0] - place.forward[0] * length * 0.7,
+                            place.head[1] - place.forward[1] * length * 0.7,
+                        ],
+                        length * 0.6,
+                    )
+                })
+                .collect();
+            let fry_touch = circles.iter().enumerate().any(|(index, first)| {
+                circles[index + 1..]
+                    .iter()
+                    .any(|second| distance(first.0, second.0) < first.1 + second.1)
+            });
+            if fry_touch || !is_swimming {
+                return fry_touch;
+            }
+            // Read the koi's body back along its trail, a few pixels at a time.
+            let mut covered = 0.0;
+            let mut point = school.koi_heads[*frame];
+            for step_back in 1..frame_total {
+                let earlier = school.koi_heads[(frame + frame_total - step_back) % frame_total];
+                covered += distance(point, earlier);
+                point = earlier;
+                if circles
+                    .iter()
+                    .any(|(center, _)| distance(*center, point) < KOI_CLEARANCE_PIXELS)
+                {
+                    return true;
+                }
+                if covered >= setup.koi_body_length {
+                    break;
+                }
+            }
+            false
+        })
+        .count()
+}
+
+/// Frames in which any of the koi, fins and tail included, could reach the shore.
+fn count_frames_out_of_water(setup: &SchoolSetup, school: &School) -> usize {
+    /// Share of body length along the trail, and how far the fish reaches from there.
+    const KOI_REACHES: [(f64, f64); 5] = [
+        (0.0, 12.0),
+        (0.25, 36.0),
+        (0.55, 24.0),
+        (0.9, 14.0),
+        (1.0, 38.0),
+    ];
+    const SHORE_PIXELS: f64 = 6.0;
+    if matches!(setup.koi_motion, KoiMotion::Hovering { .. }) {
+        return 0;
+    }
+    let heads = &school.koi_heads;
+    let frame_total = heads.len();
+    (0..frame_total)
+        .filter(|frame| {
+            KOI_REACHES.iter().any(|(share, reach)| {
+                let wanted = share * setup.koi_body_length;
+                let mut covered = 0.0;
+                let mut point = heads[*frame];
+                for step_back in 1..frame_total {
+                    let earlier = heads[(frame + frame_total - step_back) % frame_total];
+                    covered += distance(point, earlier);
+                    point = earlier;
+                    if covered >= wanted {
+                        break;
+                    }
+                }
+                point[0] - reach < SHORE_PIXELS
+                    || point[1] - reach < SHORE_PIXELS
+                    || point[0] + reach > 520.0 - SHORE_PIXELS
+                    || point[1] + reach > 208.0 - SHORE_PIXELS
+            })
+        })
+        .count()
+}
+
+/// Simulate one whole loop and close it.
+fn swim_once(setup: &SchoolSetup, seed: u64) -> School {
     let frame_count = setup.frame_count;
-    let mut dice = Dice(setup.seed ^ 0x706f_6e64);
+    let mut dice = Dice(seed ^ 0x706f_6e64);
     let pellets_planned = plan_pellets(setup, &mut dice);
     let mut pellets = pellets_planned;
     let sink_frame = (frame_count as f64 * SINK_SHARE) as u32;
@@ -295,7 +420,7 @@ pub(crate) fn simulate_school(setup: &SchoolSetup) -> School {
                 koi_head[0] + forward[0] * 54.0,
                 koi_head[1] + forward[1] * 54.0,
             ];
-            let push = wall_push(look_ahead, KOI_BOUNDS, 14.0);
+            let push = wall_push(look_ahead, KOI_BOUNDS, 20.0);
             let toward = normalize([steer_to[0] - koi_head[0], steer_to[1] - koi_head[1]]);
             let desired = [toward[0] + push[0] * 4.0, toward[1] + push[1] * 4.0];
             let turn_limit = speed / KOI_TURN_RADIUS_PIXELS;
